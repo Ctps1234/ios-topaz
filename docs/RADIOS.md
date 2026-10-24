@@ -50,6 +50,17 @@ answer, card/application state is decoded without malformed-TLV errors, and mode
 The probe is off by default. Do not publish logs containing identifiers from other diagnostic tools;
 partition backups and EFS contents remain out of Git.
 
+A host-side parser test needs no firmware or phone. It compiles the exact block embedded in patch
+0951, checks synthetic USIM/LTE responses and exercises truncated frames with ASan/UBSan:
+
+```sh
+python3 tools/test-wwan-probe.py
+# On a compiler without ASan/UBSan:
+python3 tools/test-wwan-probe.py --no-sanitize
+```
+
+This test does not replace the full XNU build or an on-device modem test.
+
 ## 2. Next cellular milestone: IPA/GSI before provisioning
 
 The [topaz-woa SIM log](https://github.com/MakrSas/topaz-woa/blob/main/docs/P9_sim.md) is the most

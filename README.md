@@ -163,6 +163,7 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 | `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
 | `tools/mkiosroot.sh`, `tools/sweet-root-tweaks.py` | Build and adjust the HFS+ iOS root |
 | `tools/sweet-crash.py`, `sweet-log.py` | Symbolicate crash reports, read the persistent log |
+| `tools/test-wwan-probe.py` | Host-compile and fuzz-truncate the WWAN QMI parser (ASan/UBSan, no phone needed) |
 | `docs/RADIOS.md` | Bluetooth/SIM/LTE architecture, incremental milestones and safe device-test checklist |
 | `NOTES.md` | sweet's engineering log (history of the original port) |
 

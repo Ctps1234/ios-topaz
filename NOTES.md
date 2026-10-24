@@ -1,6 +1,32 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-10-15, latest)
+## Agent handoff / active work (2026-10-24, current)
+
+### Read-only WWAN diagnostic and radio plan (topaz)
+
+- Implementation commit **`1179424b3ee9c539b15213d8dba114d8272c1ba4`** on
+  `arena/57bc1a91-ios-topaz`; the immediately following commit adds the repeatable host test and
+  this handoff. The implementation branch was pushed to the user's fork.
+- Patch **0951** adds `wwan=1` to `TopazModem`: DMS/UIM/NAS service discovery and GET-only
+  `GET_REVISION`, `GET_OPERATING_MODE`, `GET_CARD_STATUS` and `GET_SERVING_SYSTEM`. It does not
+  change operating mode, provision a subscription, start a data call, or log IMEI/ICCID/AID/raw card
+  data. `modem=1` is still required; `wwan=1` is off by default.
+- `docs/RADIOS.md` separates SIM detection, IPA/GSI, LTE registration, mobile data, CoreTelephony
+  and Bluetooth. The next cellular step is the already-documented topaz-woa IPA sequence, not SIM
+  provisioning on the current kernel. Bluetooth has a plan only; no Bluetooth driver was added.
+- **Observed locally:** the complete TopazModem patch series (now 202 patches) reconstructs and the
+  result matches the edited source byte-for-byte. `tools/test-wwan-probe.py` compiles the exact new
+  block with g++ and passes synthetic USIM/LTE tests plus 32 truncated card frames and 36 truncated
+  NAS frames, both with ASan/UBSan and without sanitizers. Documentation checks pass.
+- **Not done:** no full XNU/macOS build and no phone boot. `Ctps1234/ios-topaz` currently reports
+  zero Actions workflows; dispatching `xnu.yml` returned HTTP 404, so do not claim CI success.
+  SIM detection on hardware, LTE registration, mobile data and Bluetooth remain unverified or
+  unimplemented. No device, fastboot, partition or EFS operation was attempted.
+- Next: run the full macOS XNU build when Actions is available, then a temporary known-good boot
+  with `modem=1 wwan=1 wifi=1`; save a sanitized log and verify modem + Wi-Fi stay up before starting
+  IPA. Keep a fallback image without `wwan=1`.
+
+## Agent handoff / active work (2026-10-15, superseded)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
