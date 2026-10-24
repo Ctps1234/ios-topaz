@@ -1,0 +1,449 @@
+From d2b0e88be7f36b543ef728b246665a21f7d021e9 Mon Sep 17 00:00:00 2001
+From: ios-topaz contributors <noreply@localhost>
+Date: Sat, 24 Oct 2026 18:03:36 +0000
+Subject: [PATCH] topaz: add read-only WWAN QMI probe
+
+boot-arg wwan=1 adds DMS/UIM/NAS GET-only diagnostics. It does not change operating mode, provision a subscription, start mobile data, or log IMEI/ICCID/AID. This is a safe first milestone before the AP-side IPA/GSI work required for LTE.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 390 +++++++++++++++++++++++++++++++-
+ 1 file changed, 388 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 8aa0c2f..202890d 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -730,6 +730,11 @@ svc_name(uint32_t svc)
+ 	}
+ }
+ 
++static void wwan_arrive(uint32_t svc, uint32_t node, uint32_t port);
++static bool wwan_rx(uint32_t dst_port, const uint8_t *d, uint32_t len);
++static void wwan_poll(unsigned ms);
++static void wwan_summary(void);
++
+ static void
+ qrtr_rx(const uint8_t *p, uint32_t len)
+ {
+@@ -769,6 +774,7 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			q_srv[q_srv_count].port = c->d;
+ 			q_srv_count++;
+ 		}
++		wwan_arrive(c->a, c->c, c->d);
+ 		if (c->a == QMI_SVC_WLFW) {
+ 			LOG("t=%u ms: *** WLFW service 0x45 up: inst %x node %u port %x ***", g_ms, c->b, c->c, c->d);
+ 			wlfw_arrive(c->c, c->d);
+@@ -782,8 +788,9 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			struct qrtr_ctrl r = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, dst_port, 0, 0 };
+ 			qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node, src_port, &r, sizeof(r));
+ 		}
+-		if (hlen + size <= len) {
+-			(void)svc_rx(src_node, src_port, dst_port, p + hlen, size);
++		if (hlen + size <= len &&
++		    !svc_rx(src_node, src_port, dst_port, p + hlen, size)) {
++			(void)wwan_rx(dst_port, p + hlen, size);
+ 		}
+ 		break;
+ 	case QRTR_TYPE_RESUME_TX:
+@@ -1014,6 +1021,7 @@ glink_summary(void)
+ 	    g_rx_msgs, g_tx_msgs, chan_up() ? "UP" : "down", g_ri_count, g_txq_tail - g_txq_head, g_txq_drops,
+ 	    q_modem_node, q_hello_rx, q_srv_count, q_resumes);
+ 	svc_summary();
++	wwan_summary();
+ 	for (unsigned i = 0; i < q_srv_count; i++) {
+ 		LOG("  service %x:%x node %u port %x %s", q_srv[i].svc, q_srv[i].inst, q_srv[i].node, q_srv[i].port, svc_name(q_srv[i].svc));
+ 	}
+@@ -6007,6 +6015,383 @@ svc_summary(void)
+ 	    pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err);
+ }
+ 
++/* ---------------------------------------------------------------- read-only WWAN probe */
++
++/*
++ * boot-arg wwan=1: discover the modem's DMS/UIM/NAS services and issue only
++ * GET requests. This is deliberately not SIM bring-up: do not change the
++ * operating mode, provision a subscription, start a data call or write EFS.
++ * In particular, provisioning before the AP-side IPA/GSI driver is ready can
++ * kill modem_cfg (and WLAN with it), as topaz-woa's P9 bring-up demonstrated.
++ *
++ * QMI message/TLV layouts follow libqmi and the public topaz-woa wwan.c
++ * protocol notes. No IMEI, ICCID, AID or raw card response is logged.
++ */
++#define PORT_WWAN_BASE      0x4010
++#define WWAN_POLL_MS        10000
++
++#define DMS_GET_REVISION    0x0023
++#define DMS_GET_OPER_MODE   0x002D
++#define UIM_GET_CARD_STATUS 0x002F
++#define NAS_GET_SERVING_SYS 0x0024
++
++enum { WWAN_DMS, WWAN_NAS, WWAN_UIM, WWAN_COUNT };
++struct wwan_client {
++	uint32_t svc, node, port;
++	bool up;
++	const char *name;
++};
++static struct wwan_client wwan_cl[WWAN_COUNT] = {
++	{ 0x02, 0, 0, false, "dms" },
++	{ 0x03, 0, 0, false, "nas" },
++	{ 0x0B, 0, 0, false, "uim" },
++};
++static uint16_t wwan_txn = 1, wwan_last_err[WWAN_COUNT], wwan_last_err_msg[WWAN_COUNT];
++static unsigned wwan_next_poll;
++static bool wwan_probe_announced, wwan_revision_asked;
++static int wwan_mode = -1;
++static uint8_t wwan_card_state, wwan_app_state;
++static uint32_t wwan_card_hash;
++static bool wwan_card_hash_valid;
++static uint8_t wwan_reg[6];
++static uint32_t wwan_reg_hash;
++static bool wwan_reg_hash_valid;
++
++static bool
++wwan_enabled(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		uint32_t v = 0;
++		on = PE_parse_boot_argn("wwan", &v, sizeof(v)) && v != 0;
++	}
++	return on != 0;
++}
++
++static const char *
++wwan_radio_name(uint8_t radio)
++{
++	switch (radio) {
++	case 0:  return "none";
++	case 1:  return "cdma1x";
++	case 2:  return "evdo";
++	case 4:  return "gsm";
++	case 5:  return "umts";
++	case 8:  return "lte";
++	case 9:  return "td-scdma";
++	case 12: return "5g-nr";
++	default: return "unknown";
++	}
++}
++
++static uint32_t
++wwan_hash(const uint8_t *p, uint32_t len)
++{
++	uint32_t h = 2166136261u;
++	for (uint32_t i = 0; i < len; i++) {
++		h = (h ^ p[i]) * 16777619u;
++	}
++	return h;
++}
++
++static void
++wwan_send(unsigned c, uint16_t msg)
++{
++	uint8_t b[7] = {};
++	if (c >= WWAN_COUNT || !wwan_cl[c].up) {
++		return;
++	}
++	uint16_t txn = wwan_txn++, tlv_len = 0;
++	b[0] = QMI_REQ;
++	memcpy(b + 1, &txn, 2);
++	memcpy(b + 3, &msg, 2);
++	memcpy(b + 5, &tlv_len, 2);
++	qrtr_send(QRTR_TYPE_DATA, PORT_WWAN_BASE + c, wwan_cl[c].node, wwan_cl[c].port, b, sizeof(b));
++}
++
++static void
++wwan_query(void)
++{
++	if (wwan_cl[WWAN_DMS].up && !wwan_revision_asked) {
++		wwan_revision_asked = true;
++		wwan_send(WWAN_DMS, DMS_GET_REVISION);
++	}
++	wwan_send(WWAN_DMS, DMS_GET_OPER_MODE);
++	wwan_send(WWAN_UIM, UIM_GET_CARD_STATUS);
++	wwan_send(WWAN_NAS, NAS_GET_SERVING_SYS);
++}
++
++static void
++wwan_arrive(uint32_t svc, uint32_t node, uint32_t port)
++{
++	if (!wwan_enabled()) {
++		return;
++	}
++	for (unsigned c = 0; c < WWAN_COUNT; c++) {
++		if (wwan_cl[c].svc == svc && (!wwan_cl[c].up || wwan_cl[c].node != node || wwan_cl[c].port != port)) {
++			wwan_cl[c].node = node;
++			wwan_cl[c].port = port;
++			wwan_cl[c].up = true;
++			wwan_next_poll = 0;
++			LOG("t=%u ms: wwan: %s service up (node %u port %x)", g_ms, wwan_cl[c].name, node, port);
++		}
++	}
++}
++
++static void
++wwan_poll(unsigned ms)
++{
++	if (!wwan_enabled()) {
++		return;
++	}
++	if (!wwan_probe_announced) {
++		wwan_probe_announced = true;
++		LOG("wwan: read-only QMI probe on (GET only; no provisioning, identifiers hidden)");
++	}
++	if (ms >= wwan_next_poll) {
++		wwan_next_poll = ms + WWAN_POLL_MS;
++		wwan_query();
++	}
++}
++
++static uint16_t
++wwan_result(const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0, err = 0xFFFF;
++	const uint8_t *v = qm_find(d, len, 0x02, &l);
++	if (v != NULL && l >= 4) {
++		memcpy(&err, v + 2, 2);
++	}
++	return err;
++}
++
++static bool
++wwan_error(unsigned c, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	uint16_t err = wwan_result(d, len);
++	if (err == 0) {
++		wwan_last_err[c] = 0;
++		return false;
++	}
++	if (wwan_last_err[c] != err || wwan_last_err_msg[c] != msg) {
++		LOG("t=%u ms: wwan: %s msg %04x error %u", g_ms, wwan_cl[c].name, msg, err);
++	}
++	wwan_last_err[c] = err;
++	wwan_last_err_msg[c] = msg;
++	return true;
++}
++
++static const char *
++wwan_card_error(uint8_t err)
++{
++	static const char *names[] = {
++		"unknown", "power down", "poll error", "no ATR", "voltage mismatch",
++		"parity error", "possibly removed", "technical problem", "null bytes", "SAP connected",
++	};
++	return err < sizeof(names) / sizeof(names[0]) ? names[err] : "unknown";
++}
++
++static const char *
++wwan_app_type(uint8_t type)
++{
++	switch (type) {
++	case 1: return "SIM";
++	case 2: return "USIM";
++	case 3: return "RUIM";
++	case 4: return "CSIM";
++	case 5: return "ISIM";
++	default: return "unknown";
++	}
++}
++
++static const char *
++wwan_app_state_name(uint8_t state)
++{
++	switch (state) {
++	case 1: return "detected";
++	case 2: return "PIN required";
++	case 3: return "PUK required";
++	case 7: return "READY";
++	default: return "other";
++	}
++}
++
++/* UIM GET_CARD_STATUS TLV 0x10. AID is skipped, never printed. */
++static void
++wwan_card_status(const uint8_t *v, uint16_t len)
++{
++	if (len < 9) {
++		LOG("wwan: short card status (%u bytes)", len);
++		return;
++	}
++	uint16_t primary;
++	memcpy(&primary, v, 2);
++	LOG("wwan: primary GW subscription %s", primary == 0xFFFF ? "not provisioned (read-only)" : "provisioned");
++	wwan_card_state = wwan_app_state = 0;
++	bool first = true;
++	uint32_t off = 9;
++	uint8_t slots = v[8];
++	for (unsigned slot = 0; slot < slots; slot++) {
++		if (off + 6 > len) {
++			LOG("wwan: truncated card slot %u", slot + 1);
++			return;
++		}
++		uint8_t state = v[off], error = v[off + 4], apps = v[off + 5];
++		LOG("wwan: SIM slot %u: card %s%s%s, %u app(s)", slot + 1,
++		    state == 1 ? "present" : state == 0 ? "absent" : "ERROR",
++		    state == 2 ? " - " : "", state == 2 ? wwan_card_error(error) : "", apps);
++		if (state == 1 && first) {
++			wwan_card_state = state;
++		}
++		off += 6;
++		for (unsigned app = 0; app < apps; app++) {
++			if (off + 7 > len) {
++				LOG("wwan: truncated SIM application");
++				return;
++			}
++			uint8_t aid_len = v[off + 6];
++			if ((uint32_t)aid_len + 7 > len - off - 7) {
++				LOG("wwan: invalid SIM AID length %u", aid_len);
++				return;
++			}
++			uint32_t pin = off + 7 + aid_len;
++			LOG("wwan:   app %u: %s state %u (%s), PIN1 state %u retries %u, PUK1 retries %u",
++			    app, wwan_app_type(v[off]), v[off + 1], wwan_app_state_name(v[off + 1]),
++			    v[pin + 1], v[pin + 2], v[pin + 3]);
++			if (state == 1 && first) {
++				wwan_app_state = v[off + 1];
++			}
++			off = pin + 7;
++		}
++		if (state == 1) {
++			first = false;
++		}
++	}
++}
++
++static void
++wwan_dms_rx(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	if (wwan_error(WWAN_DMS, msg, d, len)) {
++		return;
++	}
++	uint16_t l = 0;
++	const uint8_t *v;
++	if (msg == DMS_GET_REVISION) {
++		char revision[64];
++		qm_string(d, len, 0x01, revision, sizeof(revision));
++		if (revision[0] != 0) {
++			LOG("wwan: modem firmware %s", revision);
++		}
++	} else if (msg == DMS_GET_OPER_MODE && (v = qm_find(d, len, 0x01, &l)) != NULL && l >= 1) {
++		static const char *modes[] = {
++			"online", "low-power", "factory-test", "offline", "resetting", "shutting-down",
++			"persistent-low-power", "mode-only-low-power",
++		};
++		if (wwan_mode != v[0]) {
++			wwan_mode = v[0];
++			LOG("wwan: operating mode %u (%s); leaving it unchanged", v[0],
++			    v[0] < sizeof(modes) / sizeof(modes[0]) ? modes[v[0]] : "unknown");
++		}
++	}
++}
++
++static void
++wwan_uim_rx(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	if (msg != UIM_GET_CARD_STATUS || wwan_error(WWAN_UIM, msg, d, len)) {
++		return;
++	}
++	uint16_t l = 0;
++	const uint8_t *v = qm_find(d, len, 0x10, &l);
++	if (v != NULL) {
++		uint32_t h = wwan_hash(v, l);
++		if (!wwan_card_hash_valid || h != wwan_card_hash) {
++			wwan_card_hash_valid = true;
++			wwan_card_hash = h;
++			wwan_card_status(v, l);
++		}
++	}
++}
++
++static void
++wwan_nas_rx(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	if (msg != NAS_GET_SERVING_SYS || wwan_error(WWAN_NAS, msg, d, len)) {
++		return;
++	}
++	uint16_t l = 0;
++	const uint8_t *v = qm_find(d, len, 0x01, &l);
++	if (v == NULL || l < 5) {
++		return;
++	}
++	uint8_t reg[6] = {};
++	reg[0] = v[0]; reg[1] = v[1]; reg[2] = v[2]; reg[3] = v[3]; reg[5] = v[4];
++	reg[4] = v[4] >= 1 && l >= 6 ? v[5] : 0;
++
++	uint16_t mcc = 0, mnc = 0;
++	char name[32] = {};
++	bool have_operator = false;
++	if ((v = qm_find(d, len, 0x12, &l)) != NULL && l >= 5 && v[4] <= l - 5) {
++		memcpy(&mcc, v, 2);
++		memcpy(&mnc, v + 2, 2);
++		uint16_t n = MIN((uint16_t)(sizeof(name) - 1), (uint16_t)v[4]);
++		for (uint16_t i = 0; i < n; i++) {
++			uint8_t ch = v[5 + i];
++			name[i] = ch >= 32 && ch <= 126 ? ch : '?';
++		}
++		name[n] = 0;
++		have_operator = true;
++	}
++	uint32_t h = wwan_hash(reg, sizeof(reg)) ^ wwan_hash((const uint8_t *)&mcc, 2) ^
++	    wwan_hash((const uint8_t *)&mnc, 2) ^ wwan_hash((const uint8_t *)name, sizeof(name));
++	if (wwan_reg_hash_valid && h == wwan_reg_hash) {
++		return;
++	}
++	wwan_reg_hash_valid = true;
++	wwan_reg_hash = h;
++	memcpy(wwan_reg, reg, sizeof(reg));
++	static const char *states[] = { "not registered", "REGISTERED", "searching", "denied", "unknown" };
++	LOG("wwan: network %s, CS %u PS %u, radio %s%s%03u-%02u \"%s\"",
++	    reg[0] < sizeof(states) / sizeof(states[0]) ? states[reg[0]] : "unknown",
++	    reg[1], reg[2], wwan_radio_name(reg[4]), have_operator ? ", operator " : "",
++	    have_operator ? mcc : 0, have_operator ? mnc : 0, have_operator ? name : "");
++}
++
++static bool
++wwan_rx(uint32_t dst_port, const uint8_t *d, uint32_t len)
++{
++	if (dst_port < PORT_WWAN_BASE || dst_port >= PORT_WWAN_BASE + WWAN_COUNT) {
++		return false;
++	}
++	if (!wwan_enabled() || len < 7) {
++		return true;
++	}
++	unsigned c = dst_port - PORT_WWAN_BASE;
++	if (d[0] != QMI_RESP) {
++		return true;                            /* no indications requested */
++	}
++	uint16_t msg;
++	memcpy(&msg, d + 3, 2);
++	switch (c) {
++	case WWAN_DMS: wwan_dms_rx(msg, d, len); break;
++	case WWAN_NAS: wwan_nas_rx(msg, d, len); break;
++	case WWAN_UIM: wwan_uim_rx(msg, d, len); break;
++	}
++	return true;
++}
++
++static void
++wwan_summary(void)
++{
++	if (!wwan_enabled()) {
++		return;
++	}
++	LOG("wwan: read-only; dms %u nas %u uim %u, mode %d, SIM %u app %u, registration %u radio %s",
++	    wwan_cl[WWAN_DMS].up, wwan_cl[WWAN_NAS].up, wwan_cl[WWAN_UIM].up,
++	    wwan_mode, wwan_card_state, wwan_app_state, wwan_reg[0], wwan_radio_name(wwan_reg[4]));
++}
++
+ /*
+  * After auth_and_reset: watch the modem's "slave-kernel" entry (bit0 fatal, bit1 ready,
+  * bit2 handover) and answer its IPA power query ("valid, AP IPA power off"): unanswered,
+@@ -6036,6 +6421,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 		if (glink) {
+ 			glink_poll(part, ms);
+ 			radio_poll(ms);
++			wwan_poll(ms);
+ 		}
+ 		if (glink && (ms == 3000 || ms == 20000)) {
+ 			glink_summary();                /* early, before the iOS UI covers the console */
+-- 
+2.39.5
+

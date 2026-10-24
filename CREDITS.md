@@ -55,3 +55,6 @@ SOFTWARE.
 - **ios-sweet** (dipa-studio): the XNU port this tree is built on.
 - **Mesa / freedreno**: the OpenGL ES driver for the Adreno.
 - **blacktop/darwin-xnu-build**: the XNU build scripts.
+- **MakrSas/topaz-woa**: hardware maps and protocol bring-up references for topaz. Patch 0951 is an
+  independent, read-only XNU implementation of the public QMI DMS/UIM/NAS message layouts; its
+  staging and safety constraints follow the project's published SIM/IPA bring-up findings.

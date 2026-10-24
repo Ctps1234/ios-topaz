@@ -108,13 +108,15 @@ Needs `aarch64-linux-gnu-gcc` and AOSP `mkbootimg.py` (set `MKBOOTIMG` if it is 
 ```sh
 python3 tools/mkadt.py shim/out/topaz.adt --highmem
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/topaz.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
+    --cmdline 'debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 modem=1 wifi=1 sweetfb_noconsole=1 sweetfb_hz=30'
 shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
 ```
 
 | Boot-arg | Effect |
 | --- | --- |
 | `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on `userdata`, writable |
+| `modem=1 wifi=1` | Boot the Qualcomm modem and start WLAN; both are required for the documented Wi-Fi path |
+| `wwan=1` | Opt-in **read-only** SIM/network QMI diagnostics (requires `modem=1`); does not provision a SIM, register LTE or start mobile data. See [Radio bring-up](docs/RADIOS.md) |
 | `cpus=4` | All four Gold cores; `cpus=1` is the safe fallback |
 | `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI after the first iOS frame. Leave it out to debug (much slower: every console line is drawn and scrolled by the CPU) |
 | `sweetfb_hz=30` | Panel refresh rate of the CPU frame copy |
@@ -148,6 +150,7 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 8. **6 GB model** (requested): the RAM layout is hard-coded for the 4 GB phone (`mkadt.py --highmem`, 4 GiB at `0x1_40000000`). Have the shim read the DDR ranges from the `/memory` node of the DTB that ABL passes and write them into the ADT and boot args, so one image boots both the 4 GB and the 6 GB versions. Everything else (SoC, panel, touch, battery) is the same hardware.
 9. **Speaker** (port from topaz-woa `TopazAudio` (ADSP / AudioReach) + `TopazSpeaker`, see its `docs/P9_audio.md`): ADSP firmware through TrustZone, AudioReach graph to the speaker, and an XNU audio driver that CoreAudio can output to.
 10. **Also ready in topaz-woa to port**: brightness (display adapter), USB host/OTG (`TopazOtgDxe` + XHCI), RPM requests (`TopazRpm`: rails, clocks, GPU CX level), SIM/LTE registration (`docs/P9_sim.md`). The GPU work follows `TopazGpuW`.
+11. **Bluetooth and cellular**: patch 0951 adds an opt-in read-only SIM/network diagnostic; LTE registration still needs IPA/GSI and provisioning, mobile data needs the IPA packet path and iOS integration, and Bluetooth needs a new UART/HCI controller driver. See the [radio bring-up plan and test gates](docs/RADIOS.md).
 
 ## Repository layout
 
@@ -160,6 +163,7 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 | `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
 | `tools/mkiosroot.sh`, `tools/sweet-root-tweaks.py` | Build and adjust the HFS+ iOS root |
 | `tools/sweet-crash.py`, `sweet-log.py` | Symbolicate crash reports, read the persistent log |
+| `docs/RADIOS.md` | Bluetooth/SIM/LTE architecture, incremental milestones and safe device-test checklist |
 | `NOTES.md` | sweet's engineering log (history of the original port) |
 
 Not in git: partition backups, live device trees, Apple firmware and root images, build trees.
@@ -182,6 +186,7 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0127–0128 | `sweetbusy=N`; no IOKit-daemon busy hold (IOKit never quiesced, wifid hung boot) |
 | 0131–0137, 0139 | `SweetSurface` for CoreAnimation's GL renderer: real values / bulk attachments / purgeability, wrapped client image and memory, `IOSurfaceAddress` surfaces, detach/release protocol |
 | 0138 | Empty `IOAcceleratorES` service |
+| 0951 | Opt-in `wwan=1` read-only DMS/UIM/NAS diagnostics; no SIM provisioning, mobile data or personal identifiers in logs |
 
 ## Key hardware facts (topaz)
 
