@@ -30,6 +30,9 @@ on:
       - ".github/workflows/xnu.yml"
 
 
+permissions:
+  contents: read
+
 concurrency:
   group: xnu-${{ github.ref }}
   cancel-in-progress: true
