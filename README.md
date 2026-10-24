@@ -77,7 +77,9 @@ You need a Redmi Note 12 4G (`topaz`/`tapas`, SM6225) with an **unlocked bootloa
 
 ### 1. Build the kernel
 
-The kernel builds on GitHub's macOS runners (macos-14, Xcode 15) with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build); newer Xcode's `iig` does not match the xnu-8796 IORPC ABI. Fork the repo and run, on the `topaz` branch:
+The kernel builds on GitHub's macOS runners (macos-14, Xcode 15) with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build); newer Xcode's `iig` does not match the xnu-8796 IORPC ABI. The `xnu` workflow first runs `tools/test-wwan-probe.py` on Ubuntu, then builds XNU on macOS. It runs for pushes on any branch and for pull requests when `xnu/patches/**`, the WWAN test or the workflow changes; manual dispatch is also available. If a fork has Actions disabled, enable them under **Settings → Actions → General** first.
+
+To dispatch manually on the `topaz` branch of a fork:
 
 ```sh
 gh workflow run xnu.yml -R YOU/ios-topaz --ref topaz
